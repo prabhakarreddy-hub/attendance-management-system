@@ -1,0 +1,266 @@
+from flask import Flask, request, jsonify
+import sqlite3
+from datetime import datetime, date
+from pathlib import Path
+
+app = Flask(__name__)
+
+DB_FILE = "attendance.db"
+
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            department TEXT NOT NULL,
+            shift_start TEXT NOT NULL,
+            manager_id INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            checkin_time TEXT,
+            checkout_time TEXT,
+            status TEXT DEFAULT 'Present',
+            FOREIGN KEY(employee_id) REFERENCES employees(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS leave_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            reason TEXT,
+            status TEXT DEFAULT 'Pending',
+            FOREIGN KEY(employee_id) REFERENCES employees(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def calculate_status(employee_shift, checkin_time):
+    shift_dt = datetime.strptime(employee_shift, "%H:%M:%S")
+    checkin_dt = datetime.strptime(checkin_time, "%H:%M:%S")
+    if checkin_dt > shift_dt:
+        return "Late"
+    return "Present"
+
+
+@app.route("/employees", methods=["POST"])
+def add_employee():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    required = ["name", "department", "shift_start"]
+    for field in required:
+        if not data.get(field):
+            return jsonify({"error": f"Missing field: {field}"}), 400
+
+    name = data["name"]
+    department = data["department"]
+    shift_start = data["shift_start"]
+    manager_id = data.get("manager_id")
+
+    conn = get_db()
+    cursor = conn.execute(
+        "INSERT INTO employees (name, department, shift_start, manager_id) VALUES (?, ?, ?, ?)",
+        (name, department, shift_start, manager_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "Employee added successfully", "employee_id": cursor.lastrowid}), 201
+
+
+@app.route("/employees", methods=["GET"])
+def list_employees():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM employees ORDER BY id").fetchall()
+    conn.close()
+
+    employees = [dict(row) for row in rows]
+    return jsonify(employees), 200
+
+
+@app.route("/attendance/checkin", methods=["POST"])
+def check_in():
+    data = request.get_json()
+    employee_id = data.get("employee_id")
+    if not employee_id:
+        return jsonify({"error": "employee_id is required"}), 400
+
+    today = date.today().isoformat()
+    now_time = datetime.now().strftime("%H:%M:%S")
+    conn = get_db()
+
+    employee = conn.execute(
+        "SELECT shift_start FROM employees WHERE id = ?",
+        (employee_id,),
+    ).fetchone()
+
+    if not employee:
+        conn.close()
+        return jsonify({"error": "Employee not found"}), 404
+
+    existing = conn.execute(
+        "SELECT * FROM attendance WHERE employee_id = ? AND date = ?",
+        (employee_id, today),
+    ).fetchone()
+
+    if existing and existing["checkin_time"]:
+        conn.close()
+        return jsonify({"error": "Already checked in today"}), 400
+
+    if existing:
+        status = calculate_status(employee["shift_start"], now_time)
+        conn.execute(
+            "UPDATE attendance SET checkin_time = ?, status = ? WHERE id = ?",
+            (now_time, status, existing["id"]),
+        )
+    else:
+        status = calculate_status(employee["shift_start"], now_time)
+        conn.execute(
+            "INSERT INTO attendance (employee_id, date, checkin_time, status) VALUES (?, ?, ?, ?)",
+            (employee_id, today, now_time, status),
+        )
+
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Check-in successful"}), 200
+
+
+@app.route("/attendance/checkout", methods=["POST"])
+def check_out():
+    data = request.get_json()
+    employee_id = data.get("employee_id")
+    if not employee_id:
+        return jsonify({"error": "employee_id is required"}), 400
+
+    today = date.today().isoformat()
+    now_time = datetime.now().strftime("%H:%M:%S")
+    conn = get_db()
+
+    row = conn.execute(
+        "SELECT * FROM attendance WHERE employee_id = ? AND date = ?",
+        (employee_id, today),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"error": "No check-in record found for today"}), 404
+
+    if row["checkout_time"]:
+        conn.close()
+        return jsonify({"error": "Already checked out today"}), 400
+
+    conn.execute(
+        "UPDATE attendance SET checkout_time = ? WHERE id = ?",
+        (now_time, row["id"]),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Check-out successful"}), 200
+
+
+@app.route("/leaves", methods=["POST"])
+def request_leave():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    required = ["employee_id", "start_date", "end_date", "reason"]
+    for field in required:
+        if not data.get(field):
+            return jsonify({"error": f"Missing field: {field}"}), 400
+
+    employee_id = data["employee_id"]
+    start_date = data["start_date"]
+    end_date = data["end_date"]
+    reason = data["reason"]
+
+    conn = get_db()
+    employee = conn.execute("SELECT id FROM employees WHERE id = ?", (employee_id,)).fetchone()
+    if not employee:
+        conn.close()
+        return jsonify({"error": "Employee not found"}), 404
+
+    conn.execute(
+        "INSERT INTO leave_requests (employee_id, start_date, end_date, reason, status) VALUES (?, ?, ?, ?, 'Pending')",
+        (employee_id, start_date, end_date, reason),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "Leave request submitted successfully"}), 201
+
+
+@app.route("/attendance", methods=["GET"])
+def get_attendance():
+    employee_id = request.args.get("employee_id")
+    attendance_date = request.args.get("date")
+
+    query = "SELECT * FROM attendance WHERE 1=1"
+    params = []
+
+    if employee_id:
+        query += " AND employee_id = ?"
+        params.append(employee_id)
+    if attendance_date:
+        query += " AND date = ?"
+        params.append(attendance_date)
+
+    query += " ORDER BY date DESC"
+
+    conn = get_db()
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    return jsonify([dict(row) for row in rows]), 200
+
+
+@app.route("/attendance/summary", methods=["GET"])
+def attendance_summary():
+    month = request.args.get("month")  # format: YYYY-MM e.g. 2026-09
+    if not month:
+        return jsonify({"error": "month is required (YYYY-MM)"}), 400
+
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT employee_id, 
+               COUNT(*) AS total_days,
+               SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present_days,
+               SUM(CASE WHEN status = 'Late' THEN 1 ELSE 0 END) AS late_days,
+               SUM(CASE WHEN status IS NULL OR status = '' THEN 1 ELSE 0 END) AS absent_days
+        FROM attendance
+        WHERE date LIKE ?
+        GROUP BY employee_id
+        """,
+        (f"{month}-%",),
+    ).fetchall()
+    conn.close()
+
+    summary = []
+    for row in rows:
+        summary.append(dict(row))
+
+    return jsonify(summary), 200
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True)
